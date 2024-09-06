@@ -1,0 +1,44 @@
+---
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: ${svc_name}
+  namespace: ${svc_name}
+spec:
+  gateways:
+  - "${gateway}"
+  hosts:
+  - "${service_domain}"
+  http:
+  - fault:
+      delay:
+        fixedDelay: 1s
+        percentage:
+          value: 100
+    name: "${svc_name}"
+    match: 
+    - uri:
+        prefix: "${service_api}"
+    rewrite:
+      uri: "${service_api}"
+    route:
+    %{ if traffic_rate_to_new_version < 100 }
+    - destination:
+        host: ${svc_name}
+        subset: ${svc_version_new}
+      weight: ${traffic_rate_to_new_version}
+    - destination:
+        host: ${svc_name}
+        subset: ${svc_version_old}
+      weight: ${traffic_rate_to_old_version}
+    %{ else }
+    - destination:
+        host: ${svc_name}
+        subset: ${svc_version_new}
+      weight: ${traffic_rate_to_new_version}
+    %{ endif }  
+    retries:
+      attempts: 3
+      perTryTimeout: 12s
+      retryOn: 5xx
+---

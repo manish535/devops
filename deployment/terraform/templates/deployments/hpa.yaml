@@ -1,0 +1,42 @@
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: ${svc_name}-${version}
+  namespace: ${svc_name}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: ${svc_name}-${version}
+  minReplicas: ${hpa_min_replica}
+  maxReplicas: 60
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 250
+      policies:
+      - type: Percent
+        value: 100
+        periodSeconds: 15
+    scaleUp:
+      policies:
+      - periodSeconds: 5
+        type: Pods
+        value: 4
+      - periodSeconds: 5
+        type: Percent
+        value: 100
+      selectPolicy: Max
+      stabilizationWindowSeconds: 0
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: AverageValue
+        averageValue: ${hpa_avg_memory}Mi

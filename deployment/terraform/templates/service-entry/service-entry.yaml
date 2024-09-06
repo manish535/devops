@@ -1,0 +1,13 @@
+apiVersion: networking.istio.io/v1beta1
+kind: ServiceEntry
+metadata:
+  name: ${jsonencode(hosts)}
+  namespace: "${namespace}"
+spec:
+  hosts:
+  - ${jsonencode(hosts)}
+  ports:
+  - name: ${name}
+    number: ${number}
+    protocol: ${protocol}
+  resolution: ${resolution}

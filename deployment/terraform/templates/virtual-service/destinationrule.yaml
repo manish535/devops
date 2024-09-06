@@ -1,0 +1,20 @@
+apiVersion: networking.istio.io/v1alpha3
+kind: DestinationRule
+metadata:
+  name: ${svc_name}
+  namespace: ${svc_name}
+spec:
+  host: ${svc_name}
+  subsets:
+  %{ if traffic_rate_to_new_version < 100 }
+  - labels:
+      version: ${svc_version_new}
+    name: ${svc_version_new}
+  - labels:
+      version: ${svc_version_old}
+    name: ${svc_version_old}
+  %{ else }
+  - labels:
+      version: ${svc_version_new}
+    name: ${svc_version_new}
+  %{ endif }
