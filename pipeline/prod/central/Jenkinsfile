@@ -1,0 +1,173 @@
+def old_version
+
+pipeline {
+    agent any
+
+    environment {
+        PIPELINE_ENV        = "prod"
+        BRANCH_NAME         = "master"
+        BRANCH_TAG          = "${BUILD_NUMBER}"
+        IMAGE_TAG           = "${env.PIPELINE_ENV}-${env.BUILD_NUMBER}"
+        CHECK_NAMESPACE     = ""
+        AWS_ECR             = "925332100543.dkr.ecr.ap-south-1.amazonaws.com"
+        EKS_CONTEXT         = "arn:aws:eks:ap-south-1:925332100543:cluster/NoiseProductionAppEKS"
+        K8S_MANIFESTS_PATH  = "/var/lib/jenkins/k8s_manifests" //${env.K8S_MANIFESTS_PATH}
+    }
+
+    parameters {
+      choice choices: ['None', 'user-detail-service', 'noise-core-service', 'service-logging', 'service-auth-v2', 'eks-gateway'], name: 'Service'
+    }
+
+    stages {
+        stage('Checkout and build docker image') {
+            steps {   
+                script {
+                    // Checking repository
+                    if (true) {    
+                        create_ecr_repo("${params.Service}")
+                    }
+                }     
+
+                sh """#!/usr/bin/bash
+                    eval `ssh-agent -s`
+                    echo 'Image tag: ${env.IMAGE_TAG}'
+                    
+                    ssh-add /var/lib/jenkins/.ssh/devops.pem /var/lib/jenkins/.ssh/devops-deployment
+                    cd /var/lib/jenkins/devops_automation && git pull 
+                    echo "Service Name: ${params.Service}"
+                    cd /home/ubuntu/mysqldump/bitbucket/${env.PIPELINE_ENV}/ && rm -rf ${params.Service} && git clone -b ${env.BRANCH_NAME} git@bitbucket.org:gonoise/${params.Service}.git
+                    
+                    echo "Current working: $PWD"
+                    cd /home/ubuntu/mysqldump/bitbucket/${env.PIPELINE_ENV}/${params.Service} && docker build -t ${env.AWS_ECR}/${params.Service}:${env.IMAGE_TAG} --build-arg NODE_ENV=${env.BRANCH_NAME} -f /home/ubuntu/mysqldump/bitbucket/${env.PIPELINE_ENV}/${params.Service}/Dockerfile .
+                    aws ecr get-login-password --region ap-south-1 --profile devops_925332100543 | docker login --username AWS --password-stdin ${env.AWS_ECR}
+                    
+                    docker push ${env.AWS_ECR}/${params.Service}:${env.IMAGE_TAG}
+                """
+            }
+        }
+        stage('Deploy on UAT') {
+            steps {
+                script {
+                    CHECK_NAMESPACE = sh(script:"kubectl get ns ${params.Service} --context='${env.EKS_CONTEXT}' | awk '{print \$1}' | tail -n +2", returnStdout:true).trim()
+                    
+                    dest_rule = sh(script:"kubectl -n ${params.Service} get destinationrules.networking.istio.io ${params.Service} --context='${env.EKS_CONTEXT}' | awk '{print \$1}' | tail -n +2", returnStdout:true).trim()
+                    
+                    if ("${dest_rule}".isEmpty()) {
+                        echo "There is no destination rule"
+                        old_version='NA'
+                    }
+                    else{
+                        old_version = sh(script:"kubectl -n ${params.Service} get destinationrules.networking.istio.io ${params.Service} --context='${env.EKS_CONTEXT}' --output=jsonpath='{.spec.subsets[0].labels.version}'", returnStdout:true).trim()
+                    }
+                    echo "old_version: ${old_version}"                
+                }
+                sh """#!/usr/bin/bash
+                    kubectl config use-context ${env.EKS_CONTEXT}
+                    
+                    echo "Last applied version: ${old_version}"
+
+                    if [ ! -d "${env.K8S_MANIFESTS_PATH}/${env.PIPELINE_ENV}/${params.Service}" ]; then
+                        echo "Creating directory: ${env.K8S_MANIFESTS_PATH}/${env.PIPELINE_ENV}/${params.Service}"
+                        mkdir -p ${env.K8S_MANIFESTS_PATH}/${env.PIPELINE_ENV}/${params.Service}
+                    fi
+
+                    cd /var/lib/jenkins/devops_automation/eks/deployment/terraform/ && terraform init -reconfigure && terraform plan -lock=false -var-file=auth.tfvars -var="traffic_rate=0" -var="env=${env.PIPELINE_ENV}" -var="node_env=${env.BRANCH_NAME}" -var="old_version=$old_version" -var="image_tag=${env.IMAGE_TAG}" -var="svc_name=${params.Service}" -var="new_version=${env.BRANCH_TAG}" -var-file=/home/ubuntu/mysqldump/bitbucket/${env.PIPELINE_ENV}/${params.Service}/service-entry/${env.PIPELINE_ENV}.tfvars -state=${env.K8S_MANIFESTS_PATH}/${env.PIPELINE_ENV}/${params.Service}/terraform.tfstate -out=${env.K8S_MANIFESTS_PATH}/${env.PIPELINE_ENV}/${params.Service}/deployment.tfplan && terraform apply -state=${env.K8S_MANIFESTS_PATH}/${env.PIPELINE_ENV}/${params.Service}/terraform.tfstate ${env.K8S_MANIFESTS_PATH}/${env.PIPELINE_ENV}/${params.Service}/deployment.tfplan
+                    
+                    cd ${env.K8S_MANIFESTS_PATH}/${env.PIPELINE_ENV}/${params.Service}/common && kubectl --context='${env.EKS_CONTEXT}' apply -f namespace.yaml,service-account.yaml,service.yaml,peerAuthentication.yaml,ecr-registry-helper-cronjob.yaml,pdb.yaml
+                    cd ${env.K8S_MANIFESTS_PATH}/${env.PIPELINE_ENV}/${params.Service}/virtual-service && kubectl --context='${env.EKS_CONTEXT}' apply -f destinationrule.yaml,virtual-service.yaml
+                    cd ${env.K8S_MANIFESTS_PATH}/${env.PIPELINE_ENV}/${params.Service}/service_entry && for svc in `ls -ltr | awk '{print \$9}' | tail -n +2`;do echo "svc_entry: \$svc"; kubectl --context='${env.EKS_CONTEXT}' apply -f \$svc/service-entry.yaml;done
+                    kubectl delete secrets ecr-login  -n ${params.Service} --context='${env.EKS_CONTEXT}'
+                    kubectl create secret docker-registry ecr-login --docker-server=${env.AWS_ECR} --docker-username=AWS --docker-password=\$(aws ecr get-login-password --profile devops_925332100543) --namespace=${params.Service} --context='${env.EKS_CONTEXT}'
+
+                    cd ${env.K8S_MANIFESTS_PATH}/${env.PIPELINE_ENV}/${params.Service}/deployments && kubectl --context='${env.EKS_CONTEXT}' apply -f deployment.yaml,hpa.yaml
+                    sleep 5
+                """
+            }
+        }
+        stage("Traffic routing") {
+            steps {
+                sh """#!/usr/bin/bash
+
+                    BASE=0
+                    while true
+                    do                         
+                        DEPLOYMENT_STATUS_TYPE=`kubectl --context='${env.EKS_CONTEXT}' -n ${params.Service} get deployments.apps "${params.Service}-v-${env.BRANCH_TAG}" --output=jsonpath="{.status.conditions[\$BASE].type}"`                       
+
+                        if [[ \$DEPLOYMENT_STATUS_TYPE -eq "Available" ]]; then
+
+                            DEPLOYMENT_STATUS_STATUS=`kubectl --context='${env.EKS_CONTEXT}' -n ${params.Service} get deployments.apps "${params.Service}-v-${env.BRANCH_TAG}" --output=jsonpath="{.status.conditions[\$BASE].status}"`
+
+                            if [[ \$DEPLOYMENT_STATUS_STATUS = "True" ]]; then
+                                break
+                            else
+                                BASE=0
+                                sleep 3
+                            fi
+                        else
+                            ((BASE+=1))
+                        fi  
+
+                        echo "Waiting for deployment to complete..."               
+                    done
+                """
+                script {
+                    route_traffic("${old_version}")
+                }  
+            }
+        }
+
+        stage('Clean up') {
+            steps {
+                sh """#!/usr/bin/bash
+                    echo "Cleaning UP old resources"
+                    echo 'old_version Clean: ${old_version}'
+                    # Cleaning up deployments
+                    for deployments in `kubectl --context='${env.EKS_CONTEXT}' -n ${params.Service} get deployments.apps | awk '{print \$1}' | tail -n +2`;
+                    do                                                 
+                        if [ \$deployments == "${params.Service}-v-${env.BRANCH_TAG}" ]; then
+                            echo "Avoiding current deployment: \$deployments"
+                        else
+                            echo "Removing old deployment: \$deployments"
+                            kubectl --context='${env.EKS_CONTEXT}' -n ${params.Service} delete deployments.apps \$deployments
+                        fi
+                    done
+
+                    # Cleaning up hpa
+                    for hpa in `kubectl --context='${env.EKS_CONTEXT}' -n ${params.Service} get hpa | awk '{print \$1}' | tail -n +2`;
+                    do                                                 
+                        if [ \$hpa == "${params.Service}-v-${env.BRANCH_TAG}" ]; then
+                            echo "Avoiding current hpa: \$deployments"
+                        else
+                            echo "Removing old hpa: \$hpa"
+                            kubectl --context='${env.EKS_CONTEXT}' -n ${params.Service} delete hpa \$hpa
+                        fi
+                    done
+                """
+            }
+        }
+    }
+}
+
+def create_ecr_repo(String REPO_NAME){
+    echo "Creating ECR repository if doesn't exist"
+    sh(script:"aws ecr describe-repositories --repository-names $REPO_NAME --profile devops_925332100543 || aws ecr create-repository --repository-name $REPO_NAME --profile devops_925332100543", returnStdout:true).trim()
+}
+
+def route_traffic(String old_version) {
+
+    TRAFFIC_RATE=0
+    echo "$old_version"
+
+    while(TRAFFIC_RATE != "100") {
+
+        echo "traffic_rate: $TRAFFIC_RATE"
+        TRAFFIC_RATE = input message: 'Traffic percentage', parameters: [choice(choices: ['10', '25', '50', '75', '100'], name: 'Traffic Rate')]
+
+        sh """
+            kubectl config use-context ${env.EKS_CONTEXT}
+            echo "In sh traffic_rate: $TRAFFIC_RATE $old_version"
+            cd /var/lib/jenkins/devops_automation/eks/deployment/terraform/ && terraform init -reconfigure && terraform plan -lock=false -target=template_dir.virtual_service -var="traffic_rate=$TRAFFIC_RATE" -var-file=auth.tfvars -var="env=${env.PIPELINE_ENV}" -var="node_env=${env.BRANCH_NAME}" -var="old_version=$old_version" -var="image_tag=${env.IMAGE_TAG}" -var="svc_name=${params.Service}" -var="new_version=${env.BRANCH_TAG}" -var-file=/home/ubuntu/mysqldump/bitbucket/${env.PIPELINE_ENV}/${params.Service}/service-entry/${env.PIPELINE_ENV}.tfvars -state=${env.K8S_MANIFESTS_PATH}/${env.PIPELINE_ENV}/${params.Service}/terraform.tfstate -out=${env.K8S_MANIFESTS_PATH}/${env.PIPELINE_ENV}/${params.Service}/deployment.tfplan && terraform apply -state=${env.K8S_MANIFESTS_PATH}/${env.PIPELINE_ENV}/${params.Service}/terraform.tfstate ${env.K8S_MANIFESTS_PATH}/${env.PIPELINE_ENV}/${params.Service}/deployment.tfplan
+            cd ${env.K8S_MANIFESTS_PATH}/${env.PIPELINE_ENV}/${params.Service}/virtual-service && kubectl --context='${env.EKS_CONTEXT}' apply -f destinationrule.yaml,virtual-service.yaml
+        """
+    }
+}
